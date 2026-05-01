@@ -143,16 +143,44 @@ ssh "$SSH_TARGET" "
 "
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Step 4b: Apply config + ensure plugin python deps in Hermes venv
+# ─────────────────────────────────────────────────────────────────────────────
+# Hermes ships a default config.yaml that wins over our cli-config.yaml file,
+# so we use `hermes config set` to write into the canonical config.yaml. Also
+# blank `model.base_url` because the default value (openrouter) silently
+# overrides provider overlays (nvidia, openai-codex, etc.) and yields 401.
+echo "[4b/6] Applying config via hermes config set + installing plugin deps..."
+NIM_DEFAULT_MODEL="nvidia/llama-3.3-nemotron-super-49b-v1.5"
+ssh "$SSH_TARGET" "
+    set -e
+    export PATH=\"\$HOME/.local/bin:\$PATH\"
+    hermes config set memory.provider pgvector_memory
+    hermes config set model.provider $PROVIDER
+    if [ -n \"$MODEL\" ]; then
+        hermes config set model.default \"$MODEL\"
+    elif [ \"$PROVIDER\" = \"nvidia\" ]; then
+        hermes config set model.default \"$NIM_DEFAULT_MODEL\"
+    fi
+    hermes config set model.base_url ''
+    # Hermes venv ships without pip; bootstrap it then install plugin deps.
+    if ! ~/.hermes/hermes-agent/venv/bin/python -m pip --version >/dev/null 2>&1; then
+        ~/.hermes/hermes-agent/venv/bin/python -m ensurepip --upgrade >/dev/null
+    fi
+    ~/.hermes/hermes-agent/venv/bin/python -m pip install --quiet supabase sentence-transformers
+    echo \"  config + plugin deps installed\"
+"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Step 5: hermes doctor — verify install
 # ─────────────────────────────────────────────────────────────────────────────
 echo "[5/6] Running hermes doctor on $SSH_TARGET..."
-ssh "$SSH_TARGET" 'bash -lc "hermes doctor 2>&1 | head -50"' || echo "  (doctor returned non-zero; review output)"
+ssh "$SSH_TARGET" 'export PATH="$HOME/.local/bin:$PATH"; hermes doctor 2>&1 | grep -A 1 -E "Memory Provider|API Connectivity|SOUL.md|venv"' || echo "  (doctor returned non-zero; review output)"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 6: One-shot test — say hi as the turtle
 # ─────────────────────────────────────────────────────────────────────────────
 echo "[6/6] Quick smoke chat..."
-ssh "$SSH_TARGET" 'bash -lc "hermes -z \"Brother, identify yourself in one sentence.\" 2>&1 | tail -10"' || echo "  (one-shot returned non-zero; review output)"
+ssh "$SSH_TARGET" 'export PATH="$HOME/.local/bin:$PATH"; hermes -z "Identify yourself in one sentence." 2>&1 | tail -5' || echo "  (one-shot returned non-zero; review output)"
 
 echo
 echo ">> done. $TURTLE is up. SOUL.md and pgvector_memory plugin installed."

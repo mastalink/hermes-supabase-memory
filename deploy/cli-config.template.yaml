@@ -4,6 +4,10 @@
 model:
   provider: "${PROVIDER}"   # "nvidia" or "openai-codex" (or any Hermes provider)
   default: "${MODEL}"        # leave empty to use provider default
+  base_url: ""               # blank — let provider overlay supply the right URL.
+                              # The default config.yaml ships with openrouter base_url
+                              # which silently overrides any provider overlay (nvidia,
+                              # openai-codex, etc.) and causes 401 against NIM.
 
 memory:
   memory_enabled: true
