@@ -411,8 +411,14 @@ class SupabaseMemoryProvider(MemoryProvider):
             return
 
         cfg = load_config(hermes_home=kwargs.get("hermes_home"))
+        # Prefer explicit SUPABASE_AGENT_IDENTITY env var over Hermes'
+        # default kwarg ("default" is Hermes' generic profile name; we want
+        # the soul-scoped identity from .env).
+        env_identity = os.environ.get("SUPABASE_AGENT_IDENTITY", "").strip()
         agent_identity = kwargs.get("agent_identity")
-        if agent_identity:
+        if env_identity:
+            cfg.agent_identity = env_identity
+        elif agent_identity and str(agent_identity).strip().lower() not in ("", "default"):
             cfg.agent_identity = str(agent_identity)
         if not cfg.is_valid():
             logger.warning("SUPABASE_URL or SUPABASE_KEY not set; provider disabled")
@@ -506,7 +512,11 @@ class SupabaseMemoryProvider(MemoryProvider):
             logger.warning("sync_turn capture failed: %s", exc)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return ALL_SCHEMAS if self._initialized else []
+        # Hermes calls this during plugin registration, BEFORE `initialize`.
+        # Return the schemas unconditionally so the tools are registered;
+        # `handle_tool_call` checks `_initialized` and errors out cleanly
+        # if the plugin couldn't connect.
+        return ALL_SCHEMAS
 
     def handle_tool_call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         if not self._initialized or not self._config:
