@@ -220,20 +220,33 @@ def _adapter_capture(
     source: str = "hermes",
     metadata: Optional[dict] = None,
 ) -> dict[str, Any]:
+    """Insert a thought row.
+
+    Schema (per MOSES OB1 migrations through 2026-04-15):
+      id, content, embedding, metadata jsonb, parent_id, version,
+      source_session text, importance real, access_count, last_accessed,
+      agent_id text, created_at, updated_at.
+
+    There is NO `tags` or `source` column — those go inside `metadata`.
+    `session_id` maps to the `source_session` column.
+    """
     client = _get_client(config.url, config.key)
     vec = _embed(content, config.embedding_model)
-    row = {
-        "id": str(uuid.uuid4()),
+    md: dict[str, Any] = {"source": source}
+    if tags:
+        md["tags"] = list(tags)
+    if metadata:
+        md.update(metadata)
+    row: dict[str, Any] = {
         "content": content,
         "embedding": vec,
         "importance": float(max(0.0, min(1.0, importance))),
         "agent_id": config.agent_identity,
-        "session_id": session_id,
-        "parent_id": parent_id,
-        "tags": tags or [],
-        "source": source,
-        "metadata": metadata or {},
+        "source_session": session_id,
+        "metadata": md,
     }
+    if parent_id:
+        row["parent_id"] = parent_id
     resp = client.table(config.table_thoughts).insert(row).execute()
     if not resp.data:
         raise RuntimeError(f"Insert returned no data: {resp}")
@@ -243,6 +256,12 @@ def _adapter_capture(
 def _adapter_search(
     *, config: SupabaseConfig, query: str, k: int = 5, min_importance: float = 0.0
 ) -> list[dict[str, Any]]:
+    """Semantic search via match_thoughts RPC.
+
+    RPC signature (per supabase/migrations/20260407000001):
+      match_thoughts(query_embedding, match_threshold, match_count,
+                     filter_metadata jsonb, filter_agent_id text)
+    """
     client = _get_client(config.url, config.key)
     vec = _embed(query, config.embedding_model)
     try:
@@ -250,19 +269,22 @@ def _adapter_search(
             "match_thoughts",
             {
                 "query_embedding": vec,
+                "match_threshold": 0.5,
                 "match_count": k,
-                "agent_filter": config.agent_identity,
-                "min_importance": float(min_importance),
+                "filter_metadata": None,
+                "filter_agent_id": config.agent_identity,
             },
         ).execute()
-        if resp.data:
-            return list(resp.data)
+        rows = list(resp.data or [])
+        if min_importance > 0:
+            rows = [r for r in rows if (r.get("importance") or 0.0) >= min_importance]
+        return rows
     except Exception as exc:
-        logger.debug("match_thoughts RPC unavailable, falling back: %s", exc)
+        logger.debug("match_thoughts RPC failed, falling back to recent rows: %s", exc)
 
     resp = (
         client.table(config.table_thoughts)
-        .select("id,content,importance,session_id,parent_id,tags,created_at")
+        .select("id,content,importance,source_session,parent_id,metadata,created_at")
         .eq("agent_id", config.agent_identity)
         .gte("importance", float(min_importance))
         .order("created_at", desc=True)
@@ -278,9 +300,9 @@ def _adapter_thread(
     client = _get_client(config.url, config.key)
     resp = (
         client.table(config.table_thoughts)
-        .select("id,content,importance,parent_id,tags,created_at,source")
+        .select("id,content,importance,parent_id,metadata,created_at,source_session")
         .eq("agent_id", config.agent_identity)
-        .eq("session_id", session_id)
+        .eq("source_session", session_id)
         .order("created_at", desc=False)
         .limit(limit)
         .execute()
@@ -289,11 +311,12 @@ def _adapter_thread(
 
 
 def _adapter_stats(*, config: SupabaseConfig) -> dict[str, Any]:
+    """Aggregate stats. `tags` and `source` live inside `metadata` JSONB."""
     client = _get_client(config.url, config.key)
     started = time.monotonic()
     resp = (
         client.table(config.table_thoughts)
-        .select("id,importance,tags,created_at", count="exact")
+        .select("id,importance,metadata,created_at", count="exact")
         .eq("agent_id", config.agent_identity)
         .order("created_at", desc=True)
         .limit(100)
@@ -306,7 +329,8 @@ def _adapter_stats(*, config: SupabaseConfig) -> dict[str, Any]:
     importance_sum = 0.0
     for r in rows:
         importance_sum += float(r.get("importance") or 0.0)
-        for tag in r.get("tags") or []:
+        md = r.get("metadata") or {}
+        for tag in md.get("tags") or []:
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
     top_tags = sorted(tag_counts.items(), key=lambda kv: -kv[1])[:8]
     avg_imp = importance_sum / max(1, len(rows))
@@ -580,8 +604,9 @@ class SupabaseMemoryProvider(MemoryProvider):
                     "id": r.get("id"),
                     "content": r.get("content"),
                     "importance": r.get("importance"),
-                    "session_id": r.get("session_id"),
-                    "tags": r.get("tags") or [],
+                    "session_id": r.get("source_session"),
+                    "tags": (r.get("metadata") or {}).get("tags") or [],
+                    "similarity": r.get("similarity"),
                     "created_at": str(r.get("created_at", "")),
                 }
                 for r in rows
@@ -628,7 +653,7 @@ class SupabaseMemoryProvider(MemoryProvider):
                     "content": r.get("content"),
                     "importance": r.get("importance"),
                     "parent_id": r.get("parent_id"),
-                    "source": r.get("source"),
+                    "source": (r.get("metadata") or {}).get("source"),
                     "created_at": str(r.get("created_at", "")),
                 }
                 for r in rows
