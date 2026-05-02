@@ -35,8 +35,10 @@ except ImportError:  # pragma: no cover — standalone testing
     class MemoryProvider:  # type: ignore[no-redef]
         pass
 
-    def tool_error(msg: str) -> Dict[str, Any]:  # type: ignore[no-redef]
-        return {"error": msg}
+    def tool_error(msg: str) -> str:  # type: ignore[no-redef]
+        # Match Hermes' tools.registry.tool_error contract: return JSON string.
+        import json as _json
+        return _json.dumps({"error": msg})
 
 
 logger = logging.getLogger(__name__)
@@ -352,15 +354,20 @@ def _adapter_audit(
     thought_id: Optional[str] = None,
     details: Optional[dict] = None,
 ) -> None:
-    """Best-effort audit write. Silently skipped if table absent."""
+    """Best-effort audit write. Silently skipped if table absent.
+
+    The MOSES `memory_audit_log` table has columns: operation, thought_id,
+    details JSONB. Agent identity goes inside `details` to avoid schema drift
+    if a fleet adds new agents.
+    """
     try:
         client = _get_client(config.url, config.key)
+        merged_details = {"agent_identity": config.agent_identity, **(details or {})}
         client.table(config.table_audit).insert(
             {
                 "operation": operation,
                 "thought_id": thought_id,
-                "agent_id": config.agent_identity,
-                "details": details or {},
+                "details": merged_details,
             }
         ).execute()
     except Exception as exc:
@@ -518,22 +525,37 @@ class SupabaseMemoryProvider(MemoryProvider):
         # if the plugin couldn't connect.
         return ALL_SCHEMAS
 
-    def handle_tool_call(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Hermes contract: must return a JSON string (not a dict).
+
+        Hermes downstream code slices the result like `result[:N]`, so a
+        dict return raises `unhashable type: 'slice'` deep in the chat
+        completion outer loop. Always wrap in json.dumps.
+        """
         if not self._initialized or not self._config:
             return tool_error("pgvector memory provider is not initialized")
         try:
             if name == "brain_search":
-                return self._tool_search(args)
-            if name == "brain_capture":
-                return self._tool_capture(args)
-            if name == "brain_recall":
-                return self._tool_recall(args)
-            if name == "brain_stats":
-                return _adapter_stats(config=self._config)
-            return tool_error(f"Unknown tool: {name}")
+                payload = self._tool_search(args)
+            elif name == "brain_capture":
+                payload = self._tool_capture(args)
+            elif name == "brain_recall":
+                payload = self._tool_recall(args)
+            elif name == "brain_stats":
+                payload = _adapter_stats(config=self._config)
+            else:
+                return tool_error(f"Unknown tool: {name}")
         except Exception as exc:
             logger.exception("tool %s failed", name)
             return tool_error(f"{name} failed: {exc}")
+
+        if isinstance(payload, str):
+            return payload
+        try:
+            return json.dumps(payload, default=str)
+        except Exception as exc:
+            logger.exception("tool %s result serialization failed", name)
+            return tool_error(f"{name} result serialization failed: {exc}")
 
     def shutdown(self) -> None:
         if self._initialized:
